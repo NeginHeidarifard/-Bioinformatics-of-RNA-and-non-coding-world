@@ -318,7 +318,7 @@ Trend:
 ---
 
 **Author:** Negin Heidarifard
-**Course:** RNA Structure Bioinformatics – Master 2 GENIOMHE, Université Paris-Saclay
+**Course:** Bioinformatics of RNA and non-coding world – Master 2 GENIOMHE, Université Paris-Saclay
 
 ---
 
