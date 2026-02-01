@@ -2,10 +2,9 @@
 """
 Training script for learning statistical potentials for RNA 3D structures.
 
-Implements Task 1:
- - all important constants are parameters (max distance, bin width, min sequence separation)
- - clean modular structure
- - command-line interface (--help)
+Implements:
+- Task 1: constants as parameters (CLI, no hard-coded values)
+- Task 4: alternative non-log scoring formulation (Postic et al., 2020)
 
 Author: Negin Heidarifard
 """
@@ -15,12 +14,13 @@ import argparse
 import numpy as np
 from Bio.PDB import PDBParser
 
-
 BASES = {"A", "U", "C", "G"}
 
 
+# -----------------------------
+# Argument parsing
+# -----------------------------
 def parse_arguments():
-    """Parse command-line parameters."""
     parser = argparse.ArgumentParser(
         description="Train statistical potentials from RNA PDB structures."
     )
@@ -34,7 +34,7 @@ def parse_arguments():
     parser.add_argument(
         "--out_dir",
         required=True,
-        help="Folder where score files will be written (e.g. scores)",
+        help="Folder where score files will be written",
     )
 
     parser.add_argument(
@@ -55,26 +55,51 @@ def parse_arguments():
         "--min_sep",
         type=int,
         default=3,
-        help="Minimum sequence separation (i -> i+min_sep); default: 3",
+        help="Minimum sequence separation (default: 3)",
+    )
+
+    parser.add_argument(
+        "--formula",
+        choices=["log", "nonlog"],
+        default="log",
+        help="Scoring formula: log (Sippl) or nonlog (information gain)",
+    )
+
+    parser.add_argument(
+        "--epsilon",
+        type=float,
+        default=1e-8,
+        help="Pseudocount to avoid division by zero (default: 1e-8)",
+    )
+
+    parser.add_argument(
+        "--cap",
+        type=float,
+        default=10.0,
+        help="Absolute cap for pseudo-energy values (default: 10.0)",
     )
 
     return parser.parse_args()
 
 
+# -----------------------------
+# Utility functions
+# -----------------------------
 def get_bins(max_dist: float, bin_width: float) -> np.ndarray:
     """Return bin edges for distance histogram."""
     num_bins = int(max_dist / bin_width)
     return np.linspace(0.0, max_dist, num_bins + 1)
 
 
-def train_potential(pdb_dir, out_dir, max_dist, bin_width, min_sep):
-    """Main training routine."""
-
+# -----------------------------
+# Main training routine
+# -----------------------------
+def train_potential(args):
     parser = PDBParser(QUIET=True)
-    bins = get_bins(max_dist, bin_width)
+    bins = get_bins(args.max_dist, args.bin_width)
     num_bins = len(bins) - 1
 
-    # 10 base-pair types
+    # 10 unordered nucleotide pair types
     pair_order = [
         "AA", "AU", "AC", "AG",
         "UU", "UC", "UG",
@@ -83,29 +108,29 @@ def train_potential(pdb_dir, out_dir, max_dist, bin_width, min_sep):
     ]
     pair_to_idx = {p: i for i, p in enumerate(pair_order)}
 
-    # counts: 10 x num_bins
     obs_counts = np.zeros((len(pair_order), num_bins), dtype=float)
-    # reference counts: XX pair
     ref_counts = np.zeros(num_bins, dtype=float)
 
-    # --- loop over PDB files ---
-    for fname in os.listdir(pdb_dir):
+    # -----------------------------
+    # Loop over PDB files
+    # -----------------------------
+    for fname in os.listdir(args.pdb_dir):
         if not fname.lower().endswith(".pdb"):
             continue
 
-        path = os.path.join(pdb_dir, fname)
+        path = os.path.join(args.pdb_dir, fname)
         print(f"Processing {path}")
+
         structure = parser.get_structure("RNA", path)
         model = structure[0]
 
         for chain in model:
-            # collect residues in this chain that have C3' and are A/U/C/G
             residues = []
             for res in chain:
                 if "C3'" not in res:
                     continue
-                resname = res.get_resname().strip()[0]
-                if resname not in BASES:
+                base = res.get_resname().strip()[0]
+                if base not in BASES:
                     continue
                 residues.append(res)
 
@@ -113,28 +138,24 @@ def train_potential(pdb_dir, out_dir, max_dist, bin_width, min_sep):
             if n == 0:
                 continue
 
-            # pairwise distances with sequence separation >= min_sep
             for i in range(n):
                 res_i = residues[i]
                 base_i = res_i.get_resname().strip()[0]
                 coord_i = res_i["C3'"].coord
 
-                for j in range(i + min_sep, n):
+                for j in range(i + args.min_sep, n):
                     res_j = residues[j]
                     base_j = res_j.get_resname().strip()[0]
                     coord_j = res_j["C3'"].coord
 
-                    # Euclidean distance
                     d = np.linalg.norm(coord_i - coord_j)
-                    if d > max_dist:
+                    if d > args.max_dist:
                         continue
 
-                    # which bin?
-                    bin_idx = int(d // bin_width)
+                    bin_idx = int(d // args.bin_width)
                     if bin_idx < 0 or bin_idx >= num_bins:
                         continue
 
-                    # base-pair type (sorted so AU == UA, etc.)
                     pair = "".join(sorted([base_i, base_j]))
                     if pair not in pair_to_idx:
                         continue
@@ -142,8 +163,9 @@ def train_potential(pdb_dir, out_dir, max_dist, bin_width, min_sep):
                     obs_counts[pair_to_idx[pair], bin_idx] += 1.0
                     ref_counts[bin_idx] += 1.0
 
-    # --- convert counts to frequencies ---
-    # avoid division by zero
+    # -----------------------------
+    # Frequencies
+    # -----------------------------
     obs_sums = obs_counts.sum(axis=1, keepdims=True)
     obs_sums[obs_sums == 0.0] = 1.0
     obs_freq = obs_counts / obs_sums
@@ -153,30 +175,38 @@ def train_potential(pdb_dir, out_dir, max_dist, bin_width, min_sep):
         ref_sum = 1.0
     ref_freq = ref_counts / ref_sum
 
-    # --- compute pseudo-energy: -log(f_obs / f_ref) ---
-    eps = 1e-8
-    ratio = (obs_freq + eps) / (ref_freq + eps)
-    scores = -np.log(ratio)
+    # -----------------------------
+    # Scoring
+    # -----------------------------
+    eps = args.epsilon
 
-    # cap maximum value at +10 (as in TP)
-    scores = np.minimum(scores, 10.0)
+    if args.formula == "log":
+        scores = -np.log((obs_freq + eps) / (ref_freq + eps))
+    elif args.formula == "nonlog":
+        scores = -((obs_freq - ref_freq) / (ref_freq + eps))
+    else:
+        raise ValueError("Unknown scoring formula")
 
-    # --- write score files ---
-    os.makedirs(out_dir, exist_ok=True)
+    scores = np.clip(scores, -args.cap, args.cap)
+
+    # -----------------------------
+    # Output
+    # -----------------------------
+    os.makedirs(args.out_dir, exist_ok=True)
+
     for i, pair in enumerate(pair_order):
-        out_path = os.path.join(out_dir, f"{pair}.txt")
+        out_path = os.path.join(args.out_dir, f"{pair}.txt")
         np.savetxt(out_path, scores[i], fmt="%.6f")
         print(f"  wrote {out_path}")
 
-    print("Training completed. Score files written to:", out_dir)
+    print("Training completed.")
+    print(f"Formula: {args.formula}")
+    print("Output directory:", args.out_dir)
 
 
+# -----------------------------
+# Entry point
+# -----------------------------
 if __name__ == "__main__":
     args = parse_arguments()
-    train_potential(
-        args.pdb_dir,
-        args.out_dir,
-        args.max_dist,
-        args.bin_width,
-        args.min_sep,
-    )
+    train_potential(args)
