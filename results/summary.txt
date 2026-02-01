@@ -1,0 +1,1 @@
+All-atom score for 1Y26: 13607.0258, atom pairs: 73751
